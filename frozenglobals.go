@@ -26,10 +26,11 @@
 // which are exported as facts for importing packages.
 //
 // Known, intentional gaps (see README): interior mutation through values
-// passed to unknown functions, and init-time closures that reach post-init
-// execution through an intermediary (passed as a call argument, or laundered
-// through a phi or interface conversion) rather than being stored, returned,
-// or started as a goroutine directly.
+// passed to unknown functions, channel receives, aliases laundered through
+// projections of local heap storage, and init-time closures that reach
+// post-init execution through an intermediary (passed as a call argument, or
+// laundered through a phi or interface conversion) rather than being stored,
+// returned, or started as a goroutine directly.
 package frozenglobals
 
 import (
@@ -272,11 +273,15 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorInde
 	// position the callee writes through is a mutation too.
 	switch t := instr.(type) {
 	case *ssa.Store:
-		if g := storageRoot(t.Addr); g != nil {
+		if g := m.storageRoot(t.Addr); g != nil {
 			reportMutation(pass, instr.Pos(), g)
 		}
 	case *ssa.MapUpdate:
-		if g := storageRoot(t.Map); g != nil {
+		if g := m.storageRoot(t.Map); g != nil {
+			reportMutation(pass, instr.Pos(), g)
+		}
+	case *ssa.Send:
+		if g := m.storageRoot(t.Chan); g != nil {
 			reportMutation(pass, instr.Pos(), g)
 		}
 	case ssa.CallInstruction:
@@ -336,43 +341,198 @@ func reportMutation(pass *analysis.Pass, pos token.Pos, g *ssa.Global) {
 	})
 }
 
-// chase follows address projections and loads back to the storage a value
-// points into (or aliases): a pointer, slice, or map loaded out of some root
+// roots follows a value back to the storage it points into (or aliases),
+// returning every terminal it can reach: through address projections, loads,
+// map lookups, type assertions, aliasing conversions, tuple extractions,
+// range iteration, phi nodes (all edges), and free variables (resolved to
+// their closure bindings). A pointer, slice, or map read out of some root
 // still refers to storage reachable from that root.
-func chase(v ssa.Value) ssa.Value {
-	for {
-		switch t := v.(type) {
-		case *ssa.FieldAddr:
-			v = t.X
-		case *ssa.IndexAddr:
-			v = t.X
-		case *ssa.Slice:
-			v = t.X
-		case *ssa.UnOp:
-			if t.Op != token.MUL {
-				return v
+//
+// When m is non-nil, results of same-package calls are resolved through the
+// return-alias summaries: a callee known to return (part of) a global yields
+// that global, and one returning a parameter continues the walk at the
+// corresponding argument.
+func roots(v ssa.Value, m *mutatorIndex) []ssa.Value {
+	var out []ssa.Value
+	var visited map[ssa.Value]bool
+	var walk func(v ssa.Value)
+	resolveCall := func(call *ssa.Call, idx int) bool {
+		if m == nil {
+			return false
+		}
+		c := call.Common()
+		if c.IsInvoke() {
+			return false
+		}
+		fn, ok := c.Value.(*ssa.Function)
+		if !ok {
+			return false
+		}
+		if o := fn.Origin(); o != nil {
+			fn = o
+		}
+		ri := m.returns[fn][idx]
+		if ri == nil {
+			return false
+		}
+		for g := range ri.globals {
+			out = append(out, g)
+		}
+		for i := range ri.params {
+			if i < len(c.Args) {
+				walk(c.Args[i])
 			}
-			v = t.X // load: chase the location the value was read from
-		default:
-			return v
+		}
+		return true
+	}
+	walk = func(v ssa.Value) {
+		for {
+			switch t := v.(type) {
+			case *ssa.FieldAddr:
+				v = t.X
+			case *ssa.IndexAddr:
+				v = t.X
+			case *ssa.Index:
+				v = t.X
+			case *ssa.Slice:
+				v = t.X
+			case *ssa.SliceToArrayPointer:
+				v = t.X
+			case *ssa.Lookup:
+				v = t.X
+			case *ssa.TypeAssert:
+				v = t.X
+			case *ssa.ChangeType:
+				v = t.X
+			case *ssa.Range:
+				v = t.X
+			case *ssa.Next:
+				v = t.Iter
+			case *ssa.UnOp:
+				if t.Op != token.MUL {
+					out = append(out, v)
+					return
+				}
+				// A load of a local cell (an Alloc, possibly captured as a
+				// free variable) yields whatever was stored into it: chase
+				// the stored values. Loads of other addresses chase the
+				// address chain itself.
+				addr := t.X
+				if fv, ok := addr.(*ssa.FreeVar); ok {
+					if b := freeVarBinding(fv); b != nil {
+						addr = b
+					}
+				}
+				if alloc, ok := addr.(*ssa.Alloc); ok {
+					if visited == nil {
+						visited = make(map[ssa.Value]bool)
+					}
+					if visited[alloc] {
+						return
+					}
+					visited[alloc] = true
+					for _, ref := range *alloc.Referrers() {
+						if st, ok := ref.(*ssa.Store); ok && st.Addr == alloc {
+							walk(st.Val)
+						}
+					}
+					return
+				}
+				v = t.X // load: chase the location the value was read from
+			case *ssa.Extract:
+				if call, ok := t.Tuple.(*ssa.Call); ok {
+					if !resolveCall(call, t.Index) {
+						out = append(out, v)
+					}
+					return
+				}
+				v = t.Tuple
+			case *ssa.Call:
+				if !resolveCall(t, 0) {
+					out = append(out, v)
+				}
+				return
+			case *ssa.FreeVar:
+				b := freeVarBinding(t)
+				if b == nil {
+					out = append(out, v)
+					return
+				}
+				v = b
+			case *ssa.Phi:
+				if visited == nil {
+					visited = make(map[ssa.Value]bool)
+				}
+				if visited[t] {
+					return
+				}
+				visited[t] = true
+				for _, e := range t.Edges {
+					walk(e)
+				}
+				return
+			default:
+				out = append(out, v)
+				return
+			}
 		}
 	}
+	walk(v)
+	return out
+}
+
+// freeVarBinding resolves a closure's free variable to the value bound at the
+// closure's creation site in the enclosing function.
+func freeVarBinding(fv *ssa.FreeVar) ssa.Value {
+	fn := fv.Parent()
+	idx := -1
+	for i, v := range fn.FreeVars {
+		if v == fv {
+			idx = i
+			break
+		}
+	}
+	parent := fn.Parent()
+	if idx < 0 || parent == nil {
+		return nil
+	}
+	for _, block := range parent.Blocks {
+		for _, instr := range block.Instrs {
+			if mc, ok := instr.(*ssa.MakeClosure); ok && mc.Fn == fn && idx < len(mc.Bindings) {
+				return mc.Bindings[idx]
+			}
+		}
+	}
+	return nil
 }
 
 // storageRoot returns the global whose storage v points into (or aliases), if
 // any, so that a write through v is a write to global state.
 func storageRoot(v ssa.Value) *ssa.Global {
-	g, _ := chase(v).(*ssa.Global)
-	return g
+	return firstGlobal(roots(v, nil))
 }
 
-// addressRoot is storageRoot restricted to pure address chains: it does not
-// cross loads. It answers "is v the address of (part of) a global?", which is
-// the question that matters for escape detection. Values *loaded from*
-// globals are deliberately excluded — passing a loaded map or pointer to a
-// function is unverifiable but pervasive (fmt.Println, errors.Is, value
-// method calls), and flagging it would drown the signal.
+func firstGlobal(vs []ssa.Value) *ssa.Global {
+	for _, v := range vs {
+		if g, ok := v.(*ssa.Global); ok {
+			return g
+		}
+	}
+	return nil
+}
+
+// addressRoot is the value chase restricted to pure address chains: it does
+// not cross loads. It answers "is v the address of (part of) a global?",
+// which is the question that matters for escape detection. Values *loaded
+// from* globals are deliberately excluded — passing a loaded map or pointer
+// to a function is unverifiable but pervasive (fmt.Println, errors.Is, value
+// method calls), and flagging it would drown the signal. Phi nodes are
+// followed through all edges: a conditional address is still an address.
 func addressRoot(v ssa.Value) *ssa.Global {
+	return addressRootVisited(v, nil)
+}
+
+func addressRootVisited(v ssa.Value, visited map[ssa.Value]bool) *ssa.Global {
 	for {
 		switch t := v.(type) {
 		case *ssa.Global:
@@ -383,6 +543,20 @@ func addressRoot(v ssa.Value) *ssa.Global {
 			v = t.X
 		case *ssa.Slice:
 			v = t.X
+		case *ssa.Phi:
+			if visited == nil {
+				visited = make(map[ssa.Value]bool)
+			}
+			if visited[t] {
+				return nil
+			}
+			visited[t] = true
+			for _, e := range t.Edges {
+				if g := addressRootVisited(e, visited); g != nil {
+					return g
+				}
+			}
+			return nil
 		default:
 			return nil
 		}
@@ -402,6 +576,8 @@ func sanctionedUse(instr ssa.Instruction, v ssa.Value) bool {
 		return t.X == v
 	case *ssa.Slice:
 		return t.X == v
+	case *ssa.Phi:
+		return true // the phi's value is checked at each of its uses in turn
 	case *ssa.Store:
 		// Writing *to* the address is reported as a mutation above; storing
 		// the address itself somewhere (t.Val == v) is an escape.

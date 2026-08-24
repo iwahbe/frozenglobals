@@ -12,7 +12,7 @@ func TestAnalyzer(t *testing.T) {
 }
 
 func TestMutatorsFlag(t *testing.T) {
-	if err := frozenglobals.Analyzer.Flags.Set("mutators", "flagged.opaque"); err != nil {
+	if err := frozenglobals.Analyzer.Flags.Set("mutators", "flagged.opaque,(flagged.Filler).Fill"); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {

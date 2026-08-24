@@ -12,14 +12,18 @@ import (
 
 // defaultMutators maps a callee — a builtin by name, or a function, method,
 // or interface method by types.Func.FullName — to the signature positions it
-// writes through. The list is a curated pass over the standard library:
-// functions whose purpose is to mutate an argument, so a global-aliasing
-// value passed there is a mutation even though the write itself (often via
-// reflection) is invisible to the analysis.
+// writes through; position -1 is the receiver. The list is a curated pass
+// over the standard library: functions whose purpose is to mutate an
+// argument or their receiver's state, so a global-aliasing value passed
+// there is a mutation even though the write itself (often via reflection) is
+// invisible to the analysis. I/O receivers (io.Writer implementations,
+// *os.File, *log.Logger) are deliberately absent: writing to a global
+// destination is not global-state mutation in the sense this linter polices.
 var defaultMutators = map[string][]int{
 	// builtins
 	"append": {0}, // may write into the backing array when capacity allows
 	"clear":  {0},
+	"close":  {0},
 	"copy":   {0},
 	"delete": {0},
 
@@ -95,6 +99,87 @@ var defaultMutators = map[string][]int{
 	// database/sql (the scan destinations are variadic)
 	"(*database/sql.Rows).Scan": {0},
 	"(*database/sql.Row).Scan":  {0},
+
+	// sync: state mutated through the receiver
+	"(*sync.Mutex).Lock":           {-1},
+	"(*sync.Mutex).TryLock":        {-1},
+	"(*sync.Mutex).Unlock":         {-1},
+	"(*sync.RWMutex).Lock":         {-1},
+	"(*sync.RWMutex).TryLock":      {-1},
+	"(*sync.RWMutex).Unlock":       {-1},
+	"(*sync.RWMutex).RLock":        {-1},
+	"(*sync.RWMutex).TryRLock":     {-1},
+	"(*sync.RWMutex).RUnlock":      {-1},
+	"(*sync.Once).Do":              {-1},
+	"(*sync.WaitGroup).Add":        {-1},
+	"(*sync.WaitGroup).Done":       {-1},
+	"(*sync.Pool).Get":             {-1},
+	"(*sync.Pool).Put":             {-1},
+	"(*sync.Map).Store":            {-1},
+	"(*sync.Map).Delete":           {-1},
+	"(*sync.Map).Clear":            {-1},
+	"(*sync.Map).LoadOrStore":      {-1},
+	"(*sync.Map).LoadAndDelete":    {-1},
+	"(*sync.Map).Swap":             {-1},
+	"(*sync.Map).CompareAndSwap":   {-1},
+	"(*sync.Map).CompareAndDelete": {-1},
+
+	// bytes.Buffer / strings.Builder / in-memory readers
+	"(*bytes.Buffer).Write":          {-1},
+	"(*bytes.Buffer).WriteString":    {-1},
+	"(*bytes.Buffer).WriteByte":      {-1},
+	"(*bytes.Buffer).WriteRune":      {-1},
+	"(*bytes.Buffer).WriteTo":        {-1},
+	"(*bytes.Buffer).Read":           {-1, 0},
+	"(*bytes.Buffer).ReadByte":       {-1},
+	"(*bytes.Buffer).ReadRune":       {-1},
+	"(*bytes.Buffer).ReadString":     {-1},
+	"(*bytes.Buffer).ReadBytes":      {-1},
+	"(*bytes.Buffer).ReadFrom":       {-1},
+	"(*bytes.Buffer).Next":           {-1},
+	"(*bytes.Buffer).Reset":          {-1},
+	"(*bytes.Buffer).Truncate":       {-1},
+	"(*bytes.Buffer).Grow":           {-1},
+	"(*strings.Builder).Write":       {-1},
+	"(*strings.Builder).WriteString": {-1},
+	"(*strings.Builder).WriteByte":   {-1},
+	"(*strings.Builder).WriteRune":   {-1},
+	"(*strings.Builder).Reset":       {-1},
+	"(*strings.Builder).Grow":        {-1},
+	"(*bytes.Reader).Read":           {-1, 0},
+	"(*bytes.Reader).Seek":           {-1},
+	"(*bytes.Reader).Reset":          {-1},
+	"(*strings.Reader).Read":         {-1, 0},
+	"(*strings.Reader).Seek":         {-1},
+	"(*strings.Reader).Reset":        {-1},
+
+	// container/list
+	"(*container/list.List).PushBack":      {-1},
+	"(*container/list.List).PushFront":     {-1},
+	"(*container/list.List).PushBackList":  {-1},
+	"(*container/list.List).PushFrontList": {-1},
+	"(*container/list.List).InsertBefore":  {-1},
+	"(*container/list.List).InsertAfter":   {-1},
+	"(*container/list.List).Remove":        {-1},
+	"(*container/list.List).Init":          {-1},
+	"(*container/list.List).MoveToFront":   {-1},
+	"(*container/list.List).MoveToBack":    {-1},
+	"(*container/list.List).MoveBefore":    {-1},
+	"(*container/list.List).MoveAfter":     {-1},
+
+	// time
+	"(*time.Timer).Reset":  {-1},
+	"(*time.Timer).Stop":   {-1},
+	"(*time.Ticker).Reset": {-1},
+	"(*time.Ticker).Stop":  {-1},
+
+	// math/rand
+	"(*math/rand.Rand).Seed":    {-1},
+	"(*math/rand.Rand).Shuffle": {-1},
+	"(*math/rand.Rand).Read":    {-1, 0},
+
+	// regexp
+	"(*regexp.Regexp).Longest": {-1},
 }
 
 func init() {
@@ -104,6 +189,22 @@ func init() {
 				continue // these do not exist for unsafe.Pointer
 			}
 			defaultMutators["sync/atomic."+op+t] = []int{0}
+		}
+	}
+	// The atomic wrapper types mutate through their receiver. (The generic
+	// atomic.Pointer[T] is absent: method names of generic types embed the
+	// type parameter and are not matched.)
+	for _, t := range []string{"Bool", "Int32", "Int64", "Uint32", "Uint64", "Uintptr", "Value"} {
+		base := "(*sync/atomic." + t + ")."
+		defaultMutators[base+"Store"] = []int{-1}
+		defaultMutators[base+"Swap"] = []int{-1}
+		defaultMutators[base+"CompareAndSwap"] = []int{-1}
+		switch t {
+		case "Bool", "Value":
+		default:
+			defaultMutators[base+"Add"] = []int{-1}
+			defaultMutators[base+"And"] = []int{-1}
+			defaultMutators[base+"Or"] = []int{-1}
 		}
 	}
 }
@@ -126,15 +227,25 @@ func (f *mutatorFact) String() string {
 }
 
 // mutatorIndex answers, for a call site, which arguments the callee may write
-// through. Same-package functions are summarized by analysis; callees the
-// analysis cannot see through are covered by the known-mutators list
-// (defaults plus the -mutators flag) and by facts from annotated packages.
+// through, and which globals or parameters a callee's results alias.
+// Same-package functions are summarized by analysis; callees the analysis
+// cannot see through are covered by the known-mutators list (defaults plus
+// the -mutators flag) and by facts from annotated packages.
 type mutatorIndex struct {
 	pass   *analysis.Pass
-	byName map[string][]int // nil positions = every parameter
+	byName map[string][]int // nil positions = receiver and every parameter
 	// summaries holds mutated parameter indices for functions of this
 	// package, indexed like fn.Params (a method's receiver is index 0).
 	summaries map[*ssa.Function]map[int]bool
+	// returns holds, per function and result index, the globals and
+	// parameters (fn.Params indices) the result may alias.
+	returns map[*ssa.Function]map[int]*retInfo
+}
+
+// retInfo records what one result of a function may alias.
+type retInfo struct {
+	globals map[*ssa.Global]bool
+	params  map[int]bool
 }
 
 func newMutatorIndex(pass *analysis.Pass, extra []string) (*mutatorIndex, error) {
@@ -142,6 +253,7 @@ func newMutatorIndex(pass *analysis.Pass, extra []string) (*mutatorIndex, error)
 		pass:      pass,
 		byName:    defaultMutators,
 		summaries: make(map[*ssa.Function]map[int]bool),
+		returns:   make(map[*ssa.Function]map[int]*retInfo),
 	}
 	if len(extra) > 0 {
 		m.byName = make(map[string][]int, len(defaultMutators)+len(extra))
@@ -158,14 +270,17 @@ func newMutatorIndex(pass *analysis.Pass, extra []string) (*mutatorIndex, error)
 	return m, nil
 }
 
-// external returns the signature positions obj is known to write through,
-// from an exported fact or the known-mutators list.
+// external returns the signature positions obj is known to write through
+// (-1 is the receiver), from an exported fact or the known-mutators list.
 func (m *mutatorIndex) external(obj *types.Func) []int {
 	sig := obj.Type().(*types.Signature)
 	all := func() []int {
-		idxs := make([]int, sig.Params().Len())
-		for i := range idxs {
-			idxs[i] = i
+		var idxs []int
+		if sig.Recv() != nil {
+			idxs = append(idxs, -1)
+		}
+		for i := 0; i < sig.Params().Len(); i++ {
+			idxs = append(idxs, i)
 		}
 		return idxs
 	}
@@ -192,6 +307,7 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 	var (
 		name   string
 		args   = make(map[int]bool) // indices into c.Args
+		recv   ssa.Value            // invoke-mode receiver, when marked
 		offset int
 		sig    *types.Signature
 	)
@@ -199,7 +315,11 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 		name = c.Method.FullName()
 		sig = c.Method.Type().(*types.Signature)
 		for _, i := range m.external(c.Method) {
-			args[i] = true
+			if i == -1 {
+				recv = c.Value
+			} else {
+				args[i] = true
+			}
 		}
 	} else {
 		switch t := c.Value.(type) {
@@ -216,7 +336,7 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 			name = fn.RelString(m.pass.Pkg)
 			sig = fn.Signature
 			if sig.Recv() != nil {
-				offset = 1
+				offset = 1 // c.Args[0] is the receiver
 			}
 			for i := range c.Args {
 				if m.summaries[fn][i] {
@@ -225,7 +345,9 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 			}
 			if obj, ok := fn.Object().(*types.Func); ok {
 				for _, i := range m.external(obj) {
-					args[i+offset] = true
+					if j := i + offset; j >= 0 && j < len(c.Args) {
+						args[j] = true
+					}
 				}
 			}
 		default:
@@ -245,6 +367,9 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 			}
 		}
 		vals = append(vals, v)
+	}
+	if recv != nil {
+		vals = append(vals, recv)
 	}
 	return vals, name
 }
@@ -276,12 +401,32 @@ func packedVarargs(v ssa.Value) ([]ssa.Value, bool) {
 }
 
 // checkCall reports arguments that alias global-reachable storage passed into
-// a callee position the callee is known to write through.
+// a callee position the callee is known to write through. A call whose
+// result is assigned back over the same global (`g = append(g, x)`) is not
+// reported here: the assignment's own mutation report already covers it.
 func checkCall(pass *analysis.Pass, call ssa.CallInstruction, m *mutatorIndex) {
 	vals, name := m.mutatedValues(call.Common())
+	if len(vals) == 0 {
+		return
+	}
+	var storedInto map[*ssa.Global]bool
+	if v, ok := call.(ssa.Value); ok {
+		if refs := v.Referrers(); refs != nil {
+			for _, ref := range *refs {
+				if st, ok := ref.(*ssa.Store); ok && st.Val == v {
+					if g := m.storageRoot(st.Addr); g != nil {
+						if storedInto == nil {
+							storedInto = make(map[*ssa.Global]bool)
+						}
+						storedInto[g] = true
+					}
+				}
+			}
+		}
+	}
 	for _, v := range vals {
-		g := mutableRoot(v)
-		if g == nil {
+		g := m.mutableRoot(v)
+		if g == nil || storedInto[g] {
 			continue
 		}
 		pass.Report(analysis.Diagnostic{
@@ -293,17 +438,23 @@ func checkCall(pass *analysis.Pass, call ssa.CallInstruction, m *mutatorIndex) {
 	}
 }
 
+// storageRoot is the summary-aware chase: it additionally resolves results of
+// same-package calls known to return global or parameter aliases.
+func (m *mutatorIndex) storageRoot(v ssa.Value) *ssa.Global {
+	return firstGlobal(roots(v, m))
+}
+
 // mutableRoot returns the global whose storage the argument value aliases, if
 // writing through the value can reach it. Pure address chains are excluded:
 // those are already reported by the escape check.
-func mutableRoot(v ssa.Value) *ssa.Global {
+func (m *mutatorIndex) mutableRoot(v ssa.Value) *ssa.Global {
 	v = unwrapInterface(v)
 	if addressRoot(v) != nil {
 		return nil
 	}
 	switch v.Type().Underlying().(type) {
-	case *types.Pointer, *types.Map, *types.Slice:
-		return storageRoot(v)
+	case *types.Pointer, *types.Map, *types.Slice, *types.Chan, *types.Interface:
+		return m.storageRoot(v)
 	}
 	return nil
 }
@@ -323,33 +474,46 @@ func unwrapInterface(v ssa.Value) ssa.Value {
 
 // paramRoot returns the reference-carrying parameter of fn whose storage v
 // reaches, if any.
-func paramRoot(fn *ssa.Function, v ssa.Value) *ssa.Parameter {
-	p, ok := chase(unwrapInterface(v)).(*ssa.Parameter)
-	if !ok || p.Parent() != fn {
-		return nil
-	}
-	switch p.Type().Underlying().(type) {
-	case *types.Pointer, *types.Map, *types.Slice, *types.Interface:
-		return p
+func (m *mutatorIndex) paramRoot(fn *ssa.Function, v ssa.Value) *ssa.Parameter {
+	for _, r := range roots(unwrapInterface(v), m) {
+		p, ok := r.(*ssa.Parameter)
+		if !ok || p.Parent() != fn {
+			continue
+		}
+		switch p.Type().Underlying().(type) {
+		case *types.Pointer, *types.Map, *types.Slice, *types.Chan, *types.Interface:
+			return p
+		}
 	}
 	return nil
 }
 
-// paramMutators computes, for every function in the package, the set of
-// parameters it provably writes through — directly, or by passing the
-// parameter into a mutated position of another callee. Computed as a least
-// fixpoint: only proven mutation is recorded, so an unknown callee never
-// taints a parameter.
+func paramIndexOf(fn *ssa.Function, p *ssa.Parameter) int {
+	for i, q := range fn.Params {
+		if q == p {
+			return i
+		}
+	}
+	return -1
+}
+
+// paramMutators computes two summaries for every function in the package,
+// as one least fixpoint:
+//
+//   - the parameters it provably writes through — directly, or by passing
+//     the parameter into a mutated position of another callee;
+//   - the globals and parameters each of its results may alias.
+//
+// Only proven facts are recorded, so an unknown callee never taints a
+// parameter and reads stay unreported.
 func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
 	record := func(fn *ssa.Function, v ssa.Value) bool {
-		p := paramRoot(fn, v)
+		p := m.paramRoot(fn, v)
 		if p == nil {
 			return false
 		}
-		for i, q := range fn.Params {
-			if q == p {
-				return setSummary(m, fn, i)
-			}
+		if i := paramIndexOf(fn, p); i >= 0 {
+			return setSummary(m, fn, i)
 		}
 		return false
 	}
@@ -367,6 +531,25 @@ func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
 						if record(fn, t.Map) {
 							changed = true
 						}
+					case *ssa.Send:
+						if record(fn, t.Chan) {
+							changed = true
+						}
+					case *ssa.Return:
+						for j, res := range t.Results {
+							for _, r := range roots(res, m) {
+								switch r := r.(type) {
+								case *ssa.Global:
+									if m.setReturnGlobal(fn, j, r) {
+										changed = true
+									}
+								case *ssa.Parameter:
+									if i := paramIndexOf(fn, r); i >= 0 && m.setReturnParam(fn, j, i) {
+										changed = true
+									}
+								}
+							}
+						}
 					case ssa.CallInstruction:
 						vals, _ := m.mutatedValues(t.Common())
 						for _, v := range vals {
@@ -379,6 +562,36 @@ func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
 			}
 		}
 	}
+}
+
+func (m *mutatorIndex) retInfoFor(fn *ssa.Function, result int) *retInfo {
+	if m.returns[fn] == nil {
+		m.returns[fn] = make(map[int]*retInfo)
+	}
+	ri := m.returns[fn][result]
+	if ri == nil {
+		ri = &retInfo{globals: make(map[*ssa.Global]bool), params: make(map[int]bool)}
+		m.returns[fn][result] = ri
+	}
+	return ri
+}
+
+func (m *mutatorIndex) setReturnGlobal(fn *ssa.Function, result int, g *ssa.Global) bool {
+	ri := m.retInfoFor(fn, result)
+	if ri.globals[g] {
+		return false
+	}
+	ri.globals[g] = true
+	return true
+}
+
+func (m *mutatorIndex) setReturnParam(fn *ssa.Function, result, param int) bool {
+	ri := m.retInfoFor(fn, result)
+	if ri.params[param] {
+		return false
+	}
+	ri.params[param] = true
+	return true
 }
 
 // setSummary records that fn may write through fn.Params[i], reporting
@@ -419,14 +632,16 @@ func collectDirectives(pass *analysis.Pass, prog *ssa.Program, m *mutatorIndex) 
 				fact := &mutatorFact{All: len(names) == 0}
 				valid := true
 				for _, n := range names {
-					idx := -1
-					for i := 0; i < sig.Params().Len(); i++ {
+					idx := -2
+					if r := sig.Recv(); r != nil && r.Name() == n {
+						idx = -1 // the receiver
+					}
+					for i := 0; idx == -2 && i < sig.Params().Len(); i++ {
 						if sig.Params().At(i).Name() == n {
 							idx = i
-							break
 						}
 					}
-					if idx < 0 {
+					if idx == -2 {
 						pass.Reportf(fd.Name.Pos(),
 							"invalid //frozenglobals:mutator directive: no parameter named %q", n)
 						valid = false
@@ -449,12 +664,17 @@ func collectDirectives(pass *analysis.Pass, prog *ssa.Program, m *mutatorIndex) 
 				idxs := fact.Params
 				if fact.All {
 					idxs = idxs[:0]
+					if sig.Recv() != nil {
+						idxs = append(idxs, -1)
+					}
 					for i := 0; i < sig.Params().Len(); i++ {
 						idxs = append(idxs, i)
 					}
 				}
 				for _, i := range idxs {
-					setSummary(m, fn, i+offset)
+					if j := i + offset; j >= 0 {
+						setSummary(m, fn, j)
+					}
 				}
 			}
 		}

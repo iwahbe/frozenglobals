@@ -35,10 +35,17 @@ init-time code, and anonymous functions nested in any of those whose closure
 value does not outlive initialization):
 
 1. **Mutation** — any write whose target storage is reachable from a global,
-   chased through field/index projections and loads:
+   chased through field/index projections, loads, map lookups, type
+   assertions, aliasing conversions, phi nodes, closure captures, and local
+   cells:
    - `g = v`, `g.Field = v`, `g[i] = v`, `g[k] = v`, `*g = v`
    - writes through pointers, slices, and maps read out of a global
-     (`ptr.Field = v` where `var ptr = &T{}`)
+     (`ptr.Field = v` where `var ptr = &T{}`, `ptrMap[k].Field = v`,
+     `sink.(*T).Field = v`, writes through a conditional alias)
+   - sends on and `close` of globally-stored channels
+   - writes through results of same-package calls that return an alias of a
+     global (`getCfg().Field = v` where `getCfg` returns a global pointer,
+     tracked through parameter passthrough)
    - passing a global-aliasing pointer, map, or slice into a callee position
      the callee is known to write through: a same-package function that
      provably mutates that parameter (`helper(ptr)` where `helper` assigns
@@ -78,19 +85,27 @@ signal-to-noise ratio high:
   known mutator, or annotated — flagging every `fmt.Println(cfg)` would drown
   the signal, so unknown callees are assumed read-only. Extend coverage with
   the [known-mutators configuration](#known-mutators).
-- **Channels.** Sends on globally-stored channels are not reported.
+- **Channel receives.** Sends and `close` are reported; receives, though
+  they also alter the channel's state, are read-shaped and stay unreported.
+- **Aliases laundered through local heap storage.** A global-aliasing value
+  stored into a field of a local struct (or a local map/slice) and read back
+  is not tracked; only whole local cells (`p := ptr`, including closure
+  captures) are chased. Tracking projections of locals is pointer analysis,
+  which this linter deliberately is not.
 - `unsafe` laundering defeats the analysis (the initial conversion is caught
   by the escape check; what happens after is not).
 
 ## Known mutators
 
 Same-package callees are summarized automatically: a function that provably
-writes through a reference-carrying parameter (directly, or by passing it
-onward into another mutated position) marks that argument position as
-mutating. For callees the analysis cannot see through, a curated list covers
-standard-library functions whose purpose is to mutate an argument, including:
+writes through a reference-carrying parameter or its receiver (directly, or
+by passing it onward into another mutated position) marks that position as
+mutating, and a function returning an alias of a global or of a parameter
+propagates that alias to its callers. For callees the analysis cannot see
+through, a curated list covers standard-library functions whose purpose is to
+mutate an argument or their receiver's state, including:
 
-- the `append`, `clear`, `copy`, and `delete` builtins
+- the `append`, `clear`, `close`, `copy`, and `delete` builtins
 - decoding into an out-parameter: `encoding/json.Unmarshal` and
   `(*json.Decoder).Decode` (likewise `xml`, `gob`, `asn1`, `binary`)
 - the `fmt` scanning family (`Sscan`, `Fscanf`, …) and
@@ -99,6 +114,15 @@ standard-library functions whose purpose is to mutate an argument, including:
   `maps.Copy`/`DeleteFunc`/`Insert`, `container/heap`
 - buffer filling: `(io.Reader).Read`, `io.ReadFull`, `crypto/rand.Read`
 - all of `sync/atomic`'s pointer-argument functions
+- receiver-state mutators: `sync.Mutex`/`RWMutex`/`Once`/`WaitGroup`/`Pool`/
+  `Map` methods, the `sync/atomic` wrapper types, `bytes.Buffer`,
+  `strings.Builder`, `bytes.Reader`/`strings.Reader`, `container/list`,
+  `time.Timer`/`Ticker`, `math/rand.Rand`, `(*regexp.Regexp).Longest` —
+  flagged when called on a *loaded* global pointer (`var m = &sync.Map{}`);
+  calling through the global's own address (`var m sync.Map`) was already
+  reported by the escape check. I/O receivers (`io.Writer` implementations,
+  `*os.File`, `*log.Logger`) are deliberately absent: writing to a global
+  destination is not global-state mutation in the sense this linter polices.
 
 Two extension mechanisms:
 
@@ -124,12 +148,15 @@ Two extension mechanisms:
 
 2. **Annotation.** A package can declare its own mutators with a doc-comment
    directive, exported as an analysis fact so importing packages see it.
-   The bare form marks every parameter; the argument form names the mutated
-   parameters:
+   The bare form marks the receiver and every parameter; the argument form
+   names the mutated parameters (the receiver may be named too):
 
    ```go
    //frozenglobals:mutator dst
    func Hydrate(dst any, row Row) { ... }
+
+   //frozenglobals:mutator b
+   func (b *Buf) Merge(other *Buf) { ... }
    ```
 
 ## Standalone usage
@@ -190,9 +217,13 @@ linters:
 Built on `golang.org/x/tools/go/analysis` with the `buildssa` pass. For every
 function that is not (nested in) an init function:
 
-- `Store` and `MapUpdate` instructions are chased back through
-  `FieldAddr`/`IndexAddr`/`Slice` projections and loads to an `*ssa.Global`
-  root → **mutation**.
+- `Store`, `MapUpdate`, and `Send` targets are chased back to an
+  `*ssa.Global` root → **mutation**. The chase crosses projections
+  (`FieldAddr`/`IndexAddr`/`Index`/`Slice`/`SliceToArrayPointer`), loads,
+  `Lookup`/`Extract`/`Range`/`Next`, `TypeAssert`/`ChangeType`, `Phi` (all
+  edges), free variables (resolved to their closure bindings), loads of
+  local cells (resolved to the stored values), and results of same-package
+  calls with return-alias summaries.
 - Call arguments that chase to a global root (interface conversions
   unwrapped, loads allowed) and land in a callee position the mutator index
   marks as written-through → **mutation**. The index combines least-fixpoint

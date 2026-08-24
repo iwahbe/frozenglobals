@@ -1,10 +1,12 @@
 package c
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 )
 
 type Config struct {
@@ -108,3 +110,71 @@ func Directives() {
 
 //frozenglobals:mutator nosuch
 func BadDirective(x int) {} // want `//frozenglobals:mutator directive: no parameter named "nosuch"`
+
+// --- Return values that alias global storage. ---
+
+func getCfg() *Config { return cfg }
+
+func passthrough(c *Config) *Config { return c }
+
+func getIndirect() *Config { return passthrough(cfg) }
+
+func getPair() (*Config, error) { return cfg, nil }
+
+func freshCfg() *Config { c := *cfg; return &c } // returns a copy: fine
+
+func ReturnAliases() {
+	getCfg().Timeout = 1 // want `cfg is mutated outside of package initialization`
+	p := getCfg()
+	p.Timeout = 2                // want `cfg is mutated outside of package initialization`
+	passthrough(cfg).Timeout = 3 // want `cfg is mutated outside of package initialization`
+	getIndirect().Timeout = 4    // want `cfg is mutated outside of package initialization`
+	q, _ := getPair()
+	q.Timeout = 5           // want `cfg is mutated outside of package initialization`
+	setTimeout(getCfg(), 6) // want `cfg is mutated \(via setTimeout\) outside of package initialization`
+
+	freshCfg().Timeout = 7 // a copy: fine
+	local := &Config{}
+	passthrough(local).Timeout = 8 // fine
+}
+
+// --- Known mutators that write through their receiver. ---
+
+var registry = &sync.Map{}
+var logbuf = &bytes.Buffer{}
+
+func ReceiverMutators() {
+	registry.Store("k", 1)  // want `registry is mutated \(via \(\*sync.Map\).Store\) outside of package initialization`
+	logbuf.WriteString("x") // want `logbuf is mutated \(via \(\*bytes.Buffer\).WriteString\) outside of package initialization`
+
+	_, _ = registry.Load("k") // read-only method: fine
+	var local sync.Map
+	local.Store("k", 1) // local receiver: fine
+}
+
+// Same-package methods are summarized like any function; the receiver is a
+// parameter.
+type Box struct{ n int }
+
+func (b *Box) Set(n int) { b.n = n }
+
+var box = &Box{}
+
+func SetBox() {
+	box.Set(3) // want `box is mutated \(via \(\*(c\.)?Box\)\.Set\) outside of package initialization`
+}
+
+// A directive can name the receiver.
+//
+//frozenglobals:mutator b
+func (b *Box) Merge(other *Box) {} // want Merge:`mutator\[-1\]`
+
+func MergeBox() {
+	box.Merge(nil) // want `box is mutated \(via \(\*(c\.)?Box\)\.Merge\) outside of package initialization`
+}
+
+// --- Reassigning append reports once, via the store. ---
+
+func AppendReassign() {
+	buf = append(buf, 5) // want `buf is mutated outside of package initialization`
+}
