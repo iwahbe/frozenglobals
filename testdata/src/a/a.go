@@ -163,3 +163,34 @@ func storedHelper() {
 func spawned() {
 	counter = 14 // want `counter is mutated outside of package initialization`
 }
+
+// --- Init-time closures that cannot outlive init: still init time. ---
+
+func runNow(f func()) { f() }
+
+func init() {
+	f := func() { counter = 20 }
+	f()
+	runNow(func() { counter = 21 }) // passed as an argument: lenient, allowed
+}
+
+// --- Init-time closures that escape to post-init reachability: reported. ---
+
+var Handler func()
+
+var Handler2 = func() { counter = 31 } // want `counter is mutated outside of package initialization`
+
+var handlers = map[string]func(){}
+
+var Handler3 func()
+
+func init() {
+	Handler = func() { counter = 30 }       // want `counter is mutated outside of package initialization`
+	handlers["x"] = func() { counter = 32 } // want `counter is mutated outside of package initialization`
+	Handler3 = makeHandler()
+	go func() { counter = 34 }() // want `counter is mutated outside of package initialization`
+}
+
+func makeHandler() func() {
+	return func() { counter = 33 } // want `counter is mutated outside of package initialization`
+}

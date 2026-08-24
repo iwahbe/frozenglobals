@@ -30,8 +30,9 @@ with package initialization as the only sanctioned write window.
 ## What is reported
 
 Outside of package initialization (initializer expressions, `init` functions,
-anonymous functions nested in them, and unexported package-level functions
-that are only ever statically called from init-time code):
+unexported package-level functions that are only ever statically called from
+init-time code, and anonymous functions nested in any of those whose closure
+value does not outlive initialization):
 
 1. **Mutation** — any write whose target storage is reachable from a global,
    chased through field/index projections and loads:
@@ -57,10 +58,14 @@ The analysis is intraprocedural and syntactic about writes; the escape check
 is what keeps it honest. Remaining holes, accepted to keep the
 signal-to-noise ratio high:
 
-- **Init-time closures run later.** A closure created inside `init` is
-  treated as init-time even if `init` stores it and something calls it after
-  initialization. (Closing this would flag the pervasive immediate-helper
-  pattern inside `init`.)
+- **Init-time closures passed onward.** A closure created during init is
+  treated as post-init when its value visibly outlives initialization —
+  stored into global-reachable storage, returned, or started as a goroutine.
+  A closure that merely flows through an intermediary (passed as a call
+  argument to a callee that stashes it, or laundered through a local
+  variable's phi or an interface conversion before being stored) is still
+  treated as init-time. (Chasing arguments would flag the pervasive
+  `forEach`-style callback pattern inside `init`.)
 - **Loaded values passed onward are not tracked.** `json.Unmarshal(b, p)`
   where `p` was read out of a global can mutate global state undetected. Only
   passing `&global` itself is flagged; passing values *loaded from* globals is
@@ -138,11 +143,14 @@ Init detection: SSA names the synthetic package initializer `init` and
 source-level init functions `init#1`, `init#2`, …; anything lexically nested
 in one of those counts. On top of that lexical seed, an unexported
 package-level function counts as init-time when its every reference in the
-package is a static call (or defer) from an init-time function — computed as
-a greatest fixpoint, so transitive and mutually recursive init helpers
-qualify. Exported functions (callable from other packages), methods
-(reachable through interfaces), functions used as values, and functions
-launched with `go` never qualify.
+package is a static call (or defer) from an init-time function, and an
+anonymous function counts when its enclosing function is init-time and its
+closure value does not escape (stored into global-reachable storage,
+returned, or started with `go`) — computed as a greatest fixpoint, so
+transitive and mutually recursive init helpers qualify. Exported functions
+(callable from other packages), methods (reachable through interfaces),
+named functions used as values, and functions launched with `go` never
+qualify.
 
 ## Development
 
