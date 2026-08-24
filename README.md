@@ -39,6 +39,12 @@ value does not outlive initialization):
    - `g = v`, `g.Field = v`, `g[i] = v`, `g[k] = v`, `*g = v`
    - writes through pointers, slices, and maps read out of a global
      (`ptr.Field = v` where `var ptr = &T{}`)
+   - passing a global-aliasing pointer, map, or slice into a callee position
+     the callee is known to write through: a same-package function that
+     provably mutates that parameter (`helper(ptr)` where `helper` assigns
+     through it, computed transitively), a [known mutator](#known-mutators)
+     (`json.Unmarshal(b, ptr)`, `sort.Strings(words)`, `delete(m, k)`), or a
+     function annotated with `//frozenglobals:mutator`
 2. **Escape** — the address of (part of) a global handed out as a value, under
    which mutation can no longer be ruled out statically:
    - `f(&g)`, `sink = &g`, `return &g`
@@ -66,13 +72,65 @@ signal-to-noise ratio high:
   variable's phi or an interface conversion before being stored) is still
   treated as init-time. (Chasing arguments would flag the pervasive
   `forEach`-style callback pattern inside `init`.)
-- **Loaded values passed onward are not tracked.** `json.Unmarshal(b, p)`
-  where `p` was read out of a global can mutate global state undetected. Only
-  passing `&global` itself is flagged; passing values *loaded from* globals is
-  not, because flagging every `fmt.Println(cfg)` would drown the signal.
+- **Loaded values passed to unknown functions are not tracked.**
+  `theirpkg.Fill(p)` where `p` was read out of a global can mutate global
+  state undetected when `theirpkg.Fill` is not a same-package function, a
+  known mutator, or annotated — flagging every `fmt.Println(cfg)` would drown
+  the signal, so unknown callees are assumed read-only. Extend coverage with
+  the [known-mutators configuration](#known-mutators).
 - **Channels.** Sends on globally-stored channels are not reported.
 - `unsafe` laundering defeats the analysis (the initial conversion is caught
   by the escape check; what happens after is not).
+
+## Known mutators
+
+Same-package callees are summarized automatically: a function that provably
+writes through a reference-carrying parameter (directly, or by passing it
+onward into another mutated position) marks that argument position as
+mutating. For callees the analysis cannot see through, a curated list covers
+standard-library functions whose purpose is to mutate an argument, including:
+
+- the `append`, `clear`, `copy`, and `delete` builtins
+- decoding into an out-parameter: `encoding/json.Unmarshal` and
+  `(*json.Decoder).Decode` (likewise `xml`, `gob`, `asn1`, `binary`)
+- the `fmt` scanning family (`Sscan`, `Fscanf`, …) and
+  `(*database/sql.Rows).Scan`
+- in-place reordering: `sort.*`, `slices.Sort`/`Reverse`/`Delete`/…,
+  `maps.Copy`/`DeleteFunc`/`Insert`, `container/heap`
+- buffer filling: `(io.Reader).Read`, `io.ReadFull`, `crypto/rand.Read`
+- all of `sync/atomic`'s pointer-argument functions
+
+Two extension mechanisms:
+
+1. **Configuration.** The `-mutators` flag takes comma-separated
+   fully-qualified functions, each treated as writing through every
+   parameter:
+
+   ```sh
+   frozenglobals -mutators='github.com/you/db.Hydrate,(*github.com/you/pb.Buf).Merge' ./...
+   ```
+
+   Under golangci-lint, the same list goes in the linter settings:
+
+   ```yaml
+   settings:
+     custom:
+       frozenglobals:
+         type: module
+         settings:
+           mutators:
+             - github.com/you/db.Hydrate
+   ```
+
+2. **Annotation.** A package can declare its own mutators with a doc-comment
+   directive, exported as an analysis fact so importing packages see it.
+   The bare form marks every parameter; the argument form names the mutated
+   parameters:
+
+   ```go
+   //frozenglobals:mutator dst
+   func Hydrate(dst any, row Row) { ... }
+   ```
 
 ## Standalone usage
 
@@ -135,6 +193,11 @@ function that is not (nested in) an init function:
 - `Store` and `MapUpdate` instructions are chased back through
   `FieldAddr`/`IndexAddr`/`Slice` projections and loads to an `*ssa.Global`
   root → **mutation**.
+- Call arguments that chase to a global root (interface conversions
+  unwrapped, loads allowed) and land in a callee position the mutator index
+  marks as written-through → **mutation**. The index combines least-fixpoint
+  parameter summaries of same-package functions, the known-mutators list, and
+  imported `//frozenglobals:mutator` facts.
 - Every instruction operand that is a pure address chain rooted at a global
   (no load crossing) and is not in a sanctioned position (load source,
   further projection, store target) → **escape**.

@@ -57,12 +57,12 @@ func registerInt(*int) {}
 
 func Reads() (int, bool) {
 	n := counter
-	p := DefaultPolicy       // value copy
-	p.Retries = 10           // mutating the copy is fine
-	_ = matcher.MatchString  // value read
-	v := lookup["a"]         // map read
-	w := seq[1]              // slice read
-	x := ptr.Retries         // read through pointer
+	p := DefaultPolicy      // value copy
+	p.Retries = 10          // mutating the copy is fine
+	_ = matcher.MatchString // value read
+	v := lookup["a"]        // map read
+	w := seq[1]             // slice read
+	x := ptr.Retries        // read through pointer
 	return n + v + w + x + p.Retries, initialized
 }
 

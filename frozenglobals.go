@@ -18,8 +18,15 @@
 // pointer-receiver method on it) is reported, because mutation can no longer
 // be ruled out statically.
 //
-// Known, intentional gaps (see README): interior mutation through values that
-// are passed to other functions, and init-time closures that reach post-init
+// Passing a global-aliasing pointer, map, or slice into a callee position the
+// callee is known to write through is reported as a mutation too: same-package
+// callees are summarized by analysis, and callees the analysis cannot see
+// through are covered by a curated known-mutators list (extensible with the
+// -mutators flag) and by //frozenglobals:mutator doc-comment annotations,
+// which are exported as facts for importing packages.
+//
+// Known, intentional gaps (see README): interior mutation through values
+// passed to unknown functions, and init-time closures that reach post-init
 // execution through an intermediary (passed as a call argument, or laundered
 // through a phi or interface conversion) rather than being stored, returned,
 // or started as a goroutine directly.
@@ -38,22 +45,44 @@ import (
 // Analyzer reports mutation of package-level variables outside of package
 // initialization.
 var Analyzer = &analysis.Analyzer{
-	Name:     "frozenglobals",
-	Doc:      "reports mutation of package-level variables outside of package initialization",
-	URL:      "https://github.com/iwahbe/frozenglobals",
-	Requires: []*analysis.Analyzer{buildssa.Analyzer},
-	Run:      run,
+	Name:      "frozenglobals",
+	Doc:       "reports mutation of package-level variables outside of package initialization",
+	URL:       "https://github.com/iwahbe/frozenglobals",
+	Requires:  []*analysis.Analyzer{buildssa.Analyzer},
+	FactTypes: []analysis.Fact{(*mutatorFact)(nil)},
+	Run:       run,
+}
+
+// mutatorsFlag extends the known-mutators list: comma-separated
+// fully-qualified functions (types.Func.FullName form), each treated as
+// writing through every parameter.
+var mutatorsFlag string
+
+func init() {
+	Analyzer.Flags.StringVar(&mutatorsFlag, "mutators", "",
+		"comma-separated fully-qualified functions to treat as mutating their parameters, "+
+			`e.g. "encoding/json.Unmarshal,(*encoding/json.Decoder).Decode"`)
 }
 
 func run(pass *analysis.Pass) (any, error) {
 	s := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	var extra []string
+	if mutatorsFlag != "" {
+		extra = strings.Split(mutatorsFlag, ",")
+	}
+	m, err := newMutatorIndex(pass, extra)
+	if err != nil {
+		return nil, err
+	}
 	fns := packageFuncs(s)
 	initFns := initTimeFuncs(fns)
+	collectDirectives(pass, s.Pkg.Prog, m)
+	paramMutators(m, fns)
 	for _, fn := range fns {
 		if initFns[fn] {
 			continue
 		}
-		checkFunction(pass, fn)
+		checkFunction(pass, fn, m)
 	}
 	return nil, nil
 }
@@ -227,18 +256,20 @@ func closureEscapes(instr ssa.Instruction, v ssa.Value) bool {
 	return false
 }
 
-func checkFunction(pass *analysis.Pass, fn *ssa.Function) {
+func checkFunction(pass *analysis.Pass, fn *ssa.Function, m *mutatorIndex) {
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			checkInstruction(pass, instr)
+			checkInstruction(pass, instr, m)
 		}
 	}
 }
 
-func checkInstruction(pass *analysis.Pass, instr ssa.Instruction) {
+func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorIndex) {
 	// 1. Writes. Chase the written address back through address projections
 	// (&g.F, &g[i]) and loads of reference values (pointers, slices, maps
-	// read out of a global) to a *ssa.Global root.
+	// read out of a global) to a *ssa.Global root. Calls are checked against
+	// the mutator index: passing a global-aliasing value into a callee
+	// position the callee writes through is a mutation too.
 	switch t := instr.(type) {
 	case *ssa.Store:
 		if g := storageRoot(t.Addr); g != nil {
@@ -248,6 +279,8 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction) {
 		if g := storageRoot(t.Map); g != nil {
 			reportMutation(pass, instr.Pos(), g)
 		}
+	case ssa.CallInstruction:
+		checkCall(pass, t, m)
 	}
 
 	// 2. Escapes. Any use of an address rooted at a global, other than the
@@ -267,6 +300,21 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction) {
 			continue
 		}
 		pos := instr.Pos()
+		if pos == token.NoPos {
+			// A synthetic instruction (e.g. the implicit interface conversion
+			// of a call argument) has no position; report where its result is
+			// used instead.
+			if vi, ok := instr.(ssa.Value); ok {
+				if refs := vi.Referrers(); refs != nil {
+					for _, ref := range *refs {
+						if p := ref.Pos(); p != token.NoPos {
+							pos = p
+							break
+						}
+					}
+				}
+			}
+		}
 		if pos == token.NoPos {
 			pos = v.Pos()
 		}
@@ -288,15 +336,12 @@ func reportMutation(pass *analysis.Pass, pos token.Pos, g *ssa.Global) {
 	})
 }
 
-// storageRoot returns the global whose storage v points into (or aliases), if
-// any. It follows address projections and loads: a pointer, slice, or map
-// loaded out of a global still refers to storage reachable from that global,
-// so a write through it is a write to global state.
-func storageRoot(v ssa.Value) *ssa.Global {
+// chase follows address projections and loads back to the storage a value
+// points into (or aliases): a pointer, slice, or map loaded out of some root
+// still refers to storage reachable from that root.
+func chase(v ssa.Value) ssa.Value {
 	for {
 		switch t := v.(type) {
-		case *ssa.Global:
-			return t
 		case *ssa.FieldAddr:
 			v = t.X
 		case *ssa.IndexAddr:
@@ -305,13 +350,20 @@ func storageRoot(v ssa.Value) *ssa.Global {
 			v = t.X
 		case *ssa.UnOp:
 			if t.Op != token.MUL {
-				return nil
+				return v
 			}
 			v = t.X // load: chase the location the value was read from
 		default:
-			return nil
+			return v
 		}
 	}
+}
+
+// storageRoot returns the global whose storage v points into (or aliases), if
+// any, so that a write through v is a write to global state.
+func storageRoot(v ssa.Value) *ssa.Global {
+	g, _ := chase(v).(*ssa.Global)
+	return g
 }
 
 // addressRoot is storageRoot restricted to pure address chains: it does not
