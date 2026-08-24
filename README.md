@@ -30,7 +30,8 @@ with package initialization as the only sanctioned write window.
 ## What is reported
 
 Outside of package initialization (initializer expressions, `init` functions,
-and anonymous functions nested in them):
+anonymous functions nested in them, and unexported package-level functions
+that are only ever statically called from init-time code):
 
 1. **Mutation** — any write whose target storage is reachable from a global,
    chased through field/index projections and loads:
@@ -60,11 +61,6 @@ signal-to-noise ratio high:
   treated as init-time even if `init` stores it and something calls it after
   initialization. (Closing this would flag the pervasive immediate-helper
   pattern inside `init`.)
-- **Helpers called from init are not init.** Writes are attributed to the
-  lexical function, not the call graph, so a named function that mutates a
-  global is flagged even when it is only ever called from `init`. Inline the
-  write into `init`, or annotate the call site with
-  `//nolint:frozenglobals`.
 - **Loaded values passed onward are not tracked.** `json.Unmarshal(b, p)`
   where `p` was read out of a global can mutate global state undetected. Only
   passing `&global` itself is flagged; passing values *loaded from* globals is
@@ -140,7 +136,13 @@ function that is not (nested in) an init function:
 
 Init detection: SSA names the synthetic package initializer `init` and
 source-level init functions `init#1`, `init#2`, …; anything lexically nested
-in one of those counts.
+in one of those counts. On top of that lexical seed, an unexported
+package-level function counts as init-time when its every reference in the
+package is a static call (or defer) from an init-time function — computed as
+a greatest fixpoint, so transitive and mutually recursive init helpers
+qualify. Exported functions (callable from other packages), methods
+(reachable through interfaces), functions used as values, and functions
+launched with `go` never qualify.
 
 ## Development
 

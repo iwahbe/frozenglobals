@@ -2,7 +2,8 @@
 // variables but forbids mutating them after package initialization.
 //
 // A global written only during package initialization (initializer
-// expressions and init functions) is treated as a constant and allowed:
+// expressions, init functions, and unexported helpers only reachable from
+// them) is treated as a constant and allowed:
 //
 //	var version string                   // set via -ldflags
 //	var DefaultRetry = RetryPolicy{...}  // constant-shaped configuration
@@ -44,8 +45,9 @@ var Analyzer = &analysis.Analyzer{
 
 func run(pass *analysis.Pass) (any, error) {
 	s := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	initFns := initTimeFuncs(s)
 	for _, fn := range s.SrcFuncs {
-		if initTime(fn) {
+		if initTime(fn, initFns) {
 			continue
 		}
 		checkFunction(pass, fn)
@@ -53,24 +55,131 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// initTime reports whether fn runs as part of package initialization: the
-// synthetic package initializer, a source-level init function (which SSA
-// names "init#1", "init#2", ...), or an anonymous function nested in one.
+// initTime reports whether fn, or a function it is lexically nested in, is in
+// the init-time set.
 //
-// Anonymous functions nested in init are assumed to run at init time. A
-// closure that init stores for later execution defeats this assumption; that
-// gap is documented rather than closed, because closing it would flag the
-// common `func init() { ... immediate helper closures ... }` pattern.
-func initTime(fn *ssa.Function) bool {
+// Anonymous functions nested in an init-time function are assumed to run at
+// init time. A closure that init stores for later execution defeats this
+// assumption; that gap is documented rather than closed, because closing it
+// would flag the common `func init() { ... immediate helper closures ... }`
+// pattern.
+func initTime(fn *ssa.Function, set map[*ssa.Function]bool) bool {
 	for f := fn; f != nil; f = f.Parent() {
-		if f.Signature.Recv() != nil {
-			return false // a method named init is not an init function
-		}
-		if name := f.Name(); name == "init" || strings.HasPrefix(name, "init#") {
+		if set[f] {
 			return true
 		}
 	}
 	return false
+}
+
+// initFunction reports whether fn is an init function proper: the synthetic
+// package initializer or a source-level init function (which SSA names
+// "init#1", "init#2", ...).
+func initFunction(fn *ssa.Function) bool {
+	if fn.Signature.Recv() != nil {
+		return false // a method named init is not an init function
+	}
+	name := fn.Name()
+	return name == "init" || strings.HasPrefix(name, "init#")
+}
+
+// initTimeFuncs returns the set of functions that can only run during package
+// initialization: init functions themselves, plus unexported package-level
+// functions whose every reference is a static call (or defer) from a function
+// already in the set. Such helpers cannot execute after initialization, so
+// their writes and escapes are as harmless as init's own.
+//
+// The analysis is per-package, so an exported function may always be called
+// from elsewhere, a method may be reached through an interface, and a function
+// whose value escapes (stored, passed as an argument, launched with go) may
+// run at any time; none of those qualify.
+func initTimeFuncs(s *buildssa.SSA) map[*ssa.Function]bool {
+	// Bodies to scan for references: all source functions, plus the synthetic
+	// package initializer (which holds global initializer expressions) and its
+	// anonymous functions, which buildssa does not include in SrcFuncs.
+	scan := make([]*ssa.Function, 0, len(s.SrcFuncs)+1)
+	scan = append(scan, s.SrcFuncs...)
+	if syn := s.Pkg.Func("init"); syn != nil {
+		var addWithAnons func(fn *ssa.Function)
+		addWithAnons = func(fn *ssa.Function) {
+			scan = append(scan, fn)
+			for _, anon := range fn.AnonFuncs {
+				addWithAnons(anon)
+			}
+		}
+		addWithAnons(syn)
+	}
+
+	// For each package function: the functions that statically call it, and
+	// whether any reference disqualifies it (used as a value, invoked via go,
+	// or otherwise not a plain static call).
+	callers := make(map[*ssa.Function][]*ssa.Function)
+	disqualified := make(map[*ssa.Function]bool)
+	for _, fn := range scan {
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				var calleeSlot *ssa.Value
+				switch t := instr.(type) {
+				case *ssa.Call:
+					if !t.Call.IsInvoke() {
+						calleeSlot = &t.Call.Value
+					}
+				case *ssa.Defer: // deferred calls in init still run during init
+					if !t.Call.IsInvoke() {
+						calleeSlot = &t.Call.Value
+					}
+				}
+				for _, rand := range instr.Operands(nil) {
+					ref, ok := (*rand).(*ssa.Function)
+					if !ok {
+						continue
+					}
+					if o := ref.Origin(); o != nil {
+						ref = o // attribute generic instantiations to their declaration
+					}
+					if rand == calleeSlot {
+						callers[ref] = append(callers[ref], fn)
+					} else {
+						disqualified[ref] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Optimistically admit every qualifying candidate, then remove any with a
+	// call site outside the set until stable. The optimistic start is what
+	// lets mutually recursive init helpers qualify.
+	set := make(map[*ssa.Function]bool)
+	var candidates []*ssa.Function
+	for _, fn := range scan {
+		if initFunction(fn) {
+			set[fn] = true
+			continue
+		}
+		if fn.Parent() != nil || fn.Signature.Recv() != nil ||
+			token.IsExported(fn.Name()) || disqualified[fn] {
+			continue
+		}
+		set[fn] = true
+		candidates = append(candidates, fn)
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range candidates {
+			if !set[fn] {
+				continue
+			}
+			for _, caller := range callers[fn] {
+				if !initTime(caller, set) {
+					delete(set, fn)
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return set
 }
 
 func checkFunction(pass *analysis.Pass, fn *ssa.Function) {

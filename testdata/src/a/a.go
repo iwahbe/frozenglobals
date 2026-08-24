@@ -100,3 +100,66 @@ var sink *int
 func ReturnEscape() *Policy {
 	return &DefaultPolicy // want `address of DefaultPolicy escapes`
 }
+
+// --- Helpers that can only run during init: treated as init time. ---
+
+var seedCount int
+
+var seeded = seed() // helper called from a global initializer expression
+
+func seed() int {
+	seedCount = 1
+	return seedCount
+}
+
+func init() {
+	setupCounter()
+	setupAll()
+	registerDefaults()
+	SetupExported()
+	dualUse()
+	go spawned()
+}
+
+func setupCounter() {
+	counter = 10
+}
+
+func setupAll() { // transitive: init -> setupAll -> setupPart
+	lookup["init"] = 1
+	setupPart()
+}
+
+func setupPart() {
+	seq[0] = 1
+}
+
+func registerDefaults() {
+	registerPolicy(&DefaultPolicy) // escape inside an init-only helper is fine
+}
+
+// --- Helpers that may run after init: still reported. ---
+
+// Exported: callable from other packages.
+func SetupExported() {
+	counter = 11 // want `counter is mutated outside of package initialization`
+}
+
+// Also called from a non-init function.
+func dualUse() {
+	counter = 12 // want `counter is mutated outside of package initialization`
+}
+
+func CallsDualUse() { dualUse() }
+
+// Referenced as a value: may be called at any time.
+var helperRef = storedHelper
+
+func storedHelper() {
+	counter = 13 // want `counter is mutated outside of package initialization`
+}
+
+// Started as a goroutine from init: may outlive initialization.
+func spawned() {
+	counter = 14 // want `counter is mutated outside of package initialization`
+}
