@@ -306,19 +306,7 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorInde
 		}
 		pos := instr.Pos()
 		if pos == token.NoPos {
-			// A synthetic instruction (e.g. the implicit interface conversion
-			// of a call argument) has no position; report where its result is
-			// used instead.
-			if vi, ok := instr.(ssa.Value); ok {
-				if refs := vi.Referrers(); refs != nil {
-					for _, ref := range *refs {
-						if p := ref.Pos(); p != token.NoPos {
-							pos = p
-							break
-						}
-					}
-				}
-			}
+			pos = syntheticPos(instr)
 		}
 		if pos == token.NoPos {
 			pos = v.Pos()
@@ -330,6 +318,67 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorInde
 				relName(pass, g)),
 		})
 	}
+}
+
+// syntheticPos finds a reportable position for a synthetic (position-less)
+// instruction by searching forward, breadth-first, for the instruction that
+// consumes its result. The chain SSA builds for the implicit interface
+// conversion of a variadic argument (MakeInterface → Store into the varargs
+// array → Slice → Call) carries no useful position until the call: the
+// intermediate instructions are either position-less or, like the Store,
+// stamped with the stored value's origin — for a global, its declaration. A
+// position is therefore accepted only if it falls inside the function being
+// checked. A Store has no result; the search continues at the storage it
+// writes into, whose other uses include the consuming call.
+func syntheticPos(instr ssa.Instruction) token.Pos {
+	fn := instr.Parent()
+	inFunc := func(p token.Pos) bool {
+		if p == token.NoPos || (fn.Pos() != token.NoPos && p < fn.Pos()) {
+			return false
+		}
+		if syn := fn.Syntax(); syn != nil && p > syn.End() {
+			return false
+		}
+		return true
+	}
+	seen := map[ssa.Instruction]bool{instr: true}
+	queue := []ssa.Instruction{instr}
+	for len(queue) > 0 {
+		in := queue[0]
+		queue = queue[1:]
+		if p := in.Pos(); inFunc(p) {
+			return p
+		}
+		var next *[]ssa.Instruction
+		switch t := in.(type) {
+		case *ssa.Store:
+			base := t.Addr
+			for {
+				if ia, ok := base.(*ssa.IndexAddr); ok {
+					base = ia.X
+					continue
+				}
+				if fa, ok := base.(*ssa.FieldAddr); ok {
+					base = fa.X
+					continue
+				}
+				break
+			}
+			next = base.Referrers()
+		case ssa.Value:
+			next = t.Referrers()
+		}
+		if next == nil {
+			continue
+		}
+		for _, n := range *next {
+			if !seen[n] {
+				seen[n] = true
+				queue = append(queue, n)
+			}
+		}
+	}
+	return token.NoPos
 }
 
 func reportMutation(pass *analysis.Pass, pos token.Pos, g *ssa.Global) {

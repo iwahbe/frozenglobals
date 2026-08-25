@@ -194,3 +194,12 @@ func init() {
 func makeHandler() func() {
 	return func() { counter = 33 } // want `counter is mutated outside of package initialization`
 }
+
+// --- Escape via a synthetic instruction (the implicit interface conversion
+// of a variadic argument): reported at the call, not the declaration. ---
+
+func variadicSink(...any) {}
+
+func VarargEscape() {
+	variadicSink(&counter) // want `address of counter escapes`
+}
