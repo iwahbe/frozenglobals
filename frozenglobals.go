@@ -304,10 +304,7 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorInde
 		if sanctionedUse(instr, v) {
 			continue
 		}
-		pos := instr.Pos()
-		if pos == token.NoPos {
-			pos = syntheticPos(instr)
-		}
+		pos := escapePos(instr)
 		if pos == token.NoPos {
 			pos = v.Pos()
 		}
@@ -320,17 +317,17 @@ func checkInstruction(pass *analysis.Pass, instr ssa.Instruction, m *mutatorInde
 	}
 }
 
-// syntheticPos finds a reportable position for a synthetic (position-less)
-// instruction by searching forward, breadth-first, for the instruction that
-// consumes its result. The chain SSA builds for the implicit interface
-// conversion of a variadic argument (MakeInterface → Store into the varargs
+// escapePos finds a reportable position for an escaping instruction,
+// searching forward, breadth-first, from the instruction itself through the
+// instructions that consume its result. The chain SSA builds to pack a
+// variadic argument (an optional MakeInterface → Store into the varargs
 // array → Slice → Call) carries no useful position until the call: the
 // intermediate instructions are either position-less or, like the Store,
 // stamped with the stored value's origin — for a global, its declaration. A
 // position is therefore accepted only if it falls inside the function being
 // checked. A Store has no result; the search continues at the storage it
 // writes into, whose other uses include the consuming call.
-func syntheticPos(instr ssa.Instruction) token.Pos {
+func escapePos(instr ssa.Instruction) token.Pos {
 	fn := instr.Parent()
 	inFunc := func(p token.Pos) bool {
 		if p == token.NoPos || (fn.Pos() != token.NoPos && p < fn.Pos()) {

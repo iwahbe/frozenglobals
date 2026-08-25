@@ -203,3 +203,13 @@ func variadicSink(...any) {}
 func VarargEscape() {
 	variadicSink(&counter) // want `address of counter escapes`
 }
+
+// With a concrete pointer element type there is no interface conversion: the
+// escaping instruction is the varargs Store itself, which SSA stamps with the
+// global's declaration position rather than leaving position-less.
+
+func variadicPtrSink(...*int) {}
+
+func VarargPtrEscape() {
+	variadicPtrSink(&counter) // want `address of counter escapes`
+}
