@@ -237,6 +237,11 @@ type mutatorIndex struct {
 	// summaries holds mutated parameter indices for functions of this
 	// package, indexed like fn.Params (a method's receiver is index 0).
 	summaries map[*ssa.Function]map[int]bool
+	// deep marks the subset of summaries whose write goes through values
+	// loaded out of the parameter's storage rather than (only) to that
+	// storage itself. Only a deep write can affect the elements of a packed
+	// variadic call, whose backing array is call-site fresh.
+	deep map[*ssa.Function]map[int]bool
 	// returns holds, per function and result index, the globals and
 	// parameters (fn.Params indices) the result may alias.
 	returns map[*ssa.Function]map[int]*retInfo
@@ -253,6 +258,7 @@ func newMutatorIndex(pass *analysis.Pass, extra []string) (*mutatorIndex, error)
 		pass:      pass,
 		byName:    defaultMutators,
 		summaries: make(map[*ssa.Function]map[int]bool),
+		deep:      make(map[*ssa.Function]map[int]bool),
 		returns:   make(map[*ssa.Function]map[int]*retInfo),
 	}
 	if len(extra) > 0 {
@@ -300,14 +306,26 @@ func (m *mutatorIndex) external(obj *types.Func) []int {
 	return nil
 }
 
+// mutatedValue is one argument value a callee may write through. deep means
+// the callee writes through values loaded out of val's storage, not (only)
+// to that storage itself.
+type mutatedValue struct {
+	val  ssa.Value
+	deep bool
+}
+
 // mutatedValues returns the argument values of c that its callee may write
-// through, with a packed variadic argument expanded to its elements, and the
-// callee's name for reporting.
-func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
+// through, and the callee's name for reporting. A packed variadic argument is
+// expanded to its elements only for a deep write: a write to the slice's own
+// storage cannot affect them, since a non-spread call allocates the backing
+// array fresh. Curated external mutators of a variadic position (fmt.Scan et
+// al.) mutate through the packed values, so those positions are deep.
+func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]mutatedValue, string) {
 	var (
 		name   string
 		args   = make(map[int]bool) // indices into c.Args
-		recv   ssa.Value            // invoke-mode receiver, when marked
+		deep   = make(map[int]bool)
+		recv   ssa.Value // invoke-mode receiver, when marked
 		offset int
 		sig    *types.Signature
 	)
@@ -319,6 +337,9 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 				recv = c.Value
 			} else {
 				args[i] = true
+				if variadicParam(sig, i) {
+					deep[i] = true
+				}
 			}
 		}
 	} else {
@@ -342,11 +363,17 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 				if m.summaries[fn][i] {
 					args[i] = true
 				}
+				if m.deep[fn][i] {
+					deep[i] = true
+				}
 			}
 			if obj, ok := fn.Object().(*types.Func); ok {
 				for _, i := range m.external(obj) {
 					if j := i + offset; j >= 0 && j < len(c.Args) {
 						args[j] = true
+						if variadicParam(sig, i) {
+							deep[j] = true
+						}
 					}
 				}
 			}
@@ -354,24 +381,31 @@ func (m *mutatorIndex) mutatedValues(c *ssa.CallCommon) ([]ssa.Value, string) {
 			return nil, ""
 		}
 	}
-	var vals []ssa.Value
+	var vals []mutatedValue
 	for i := range c.Args {
 		if !args[i] {
 			continue
 		}
 		v := c.Args[i]
-		if sig != nil && sig.Variadic() && i == len(c.Args)-1 {
+		if deep[i] && sig != nil && sig.Variadic() && i == len(c.Args)-1 {
 			if elems, ok := packedVarargs(v); ok {
-				vals = append(vals, elems...)
+				for _, e := range elems {
+					vals = append(vals, mutatedValue{val: e})
+				}
 				continue
 			}
 		}
-		vals = append(vals, v)
+		vals = append(vals, mutatedValue{val: v, deep: deep[i]})
 	}
 	if recv != nil {
-		vals = append(vals, recv)
+		vals = append(vals, mutatedValue{val: recv})
 	}
 	return vals, name
+}
+
+// variadicParam reports whether signature parameter i is the variadic slice.
+func variadicParam(sig *types.Signature, i int) bool {
+	return sig.Variadic() && i == sig.Params().Len()-1
 }
 
 // packedVarargs unpacks the slice SSA builds for a non-spread call to a
@@ -424,8 +458,8 @@ func checkCall(pass *analysis.Pass, call ssa.CallInstruction, m *mutatorIndex) {
 			}
 		}
 	}
-	for _, v := range vals {
-		g := m.mutableRoot(v)
+	for _, mv := range vals {
+		g := m.mutableRoot(mv.val)
 		if g == nil || storedInto[g] {
 			continue
 		}
@@ -497,6 +531,41 @@ func paramIndexOf(fn *ssa.Function, p *ssa.Parameter) int {
 	return -1
 }
 
+// pureParam returns the parameter of fn that v is a pure projection of —
+// address projections, reslicings, and value-preserving conversions, never
+// crossing a load. A write that reaches a parameter only through such a chain
+// touches the parameter's own storage; one that crosses a load goes through
+// the values held in it.
+func pureParam(fn *ssa.Function, v ssa.Value) *ssa.Parameter {
+	for {
+		switch t := v.(type) {
+		case *ssa.Parameter:
+			if t.Parent() == fn {
+				return t
+			}
+			return nil
+		case *ssa.FieldAddr:
+			v = t.X
+		case *ssa.IndexAddr:
+			v = t.X
+		case *ssa.Slice:
+			v = t.X
+		case *ssa.SliceToArrayPointer:
+			v = t.X
+		case *ssa.ChangeType:
+			v = t.X
+		case *ssa.MakeInterface:
+			v = t.X
+		case *ssa.ChangeInterface:
+			v = t.X
+		case *ssa.TypeAssert:
+			v = t.X
+		default:
+			return nil
+		}
+	}
+}
+
 // paramMutators computes two summaries for every function in the package,
 // as one least fixpoint:
 //
@@ -507,15 +576,23 @@ func paramIndexOf(fn *ssa.Function, p *ssa.Parameter) int {
 // Only proven facts are recorded, so an unknown callee never taints a
 // parameter and reads stay unreported.
 func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
-	record := func(fn *ssa.Function, v ssa.Value) bool {
+	// deep: the write reaches the parameter through a load (or the callee's
+	// own write is deep), so it goes through the values the parameter's
+	// storage holds, not (only) that storage itself.
+	record := func(fn *ssa.Function, v ssa.Value, deep bool) bool {
 		p := m.paramRoot(fn, v)
 		if p == nil {
 			return false
 		}
-		if i := paramIndexOf(fn, p); i >= 0 {
-			return setSummary(m, fn, i)
+		i := paramIndexOf(fn, p)
+		if i < 0 {
+			return false
 		}
-		return false
+		changed := setIndex(m.summaries, fn, i)
+		if deep || pureParam(fn, v) != p {
+			changed = setIndex(m.deep, fn, i) || changed
+		}
+		return changed
 	}
 	for changed := true; changed; {
 		changed = false
@@ -524,15 +601,15 @@ func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
 				for _, instr := range block.Instrs {
 					switch t := instr.(type) {
 					case *ssa.Store:
-						if record(fn, t.Addr) {
+						if record(fn, t.Addr, false) {
 							changed = true
 						}
 					case *ssa.MapUpdate:
-						if record(fn, t.Map) {
+						if record(fn, t.Map, false) {
 							changed = true
 						}
 					case *ssa.Send:
-						if record(fn, t.Chan) {
+						if record(fn, t.Chan, false) {
 							changed = true
 						}
 					case *ssa.Return:
@@ -552,8 +629,8 @@ func paramMutators(m *mutatorIndex, fns []*ssa.Function) {
 						}
 					case ssa.CallInstruction:
 						vals, _ := m.mutatedValues(t.Common())
-						for _, v := range vals {
-							if record(fn, v) {
+						for _, mv := range vals {
+							if record(fn, mv.val, mv.deep) {
 								changed = true
 							}
 						}
@@ -594,16 +671,16 @@ func (m *mutatorIndex) setReturnParam(fn *ssa.Function, result, param int) bool 
 	return true
 }
 
-// setSummary records that fn may write through fn.Params[i], reporting
-// whether that was new information.
-func setSummary(m *mutatorIndex, fn *ssa.Function, i int) bool {
-	if m.summaries[fn][i] {
+// setIndex records index i for fn in a summary map, reporting whether that
+// was new information.
+func setIndex(mm map[*ssa.Function]map[int]bool, fn *ssa.Function, i int) bool {
+	if mm[fn][i] {
 		return false
 	}
-	if m.summaries[fn] == nil {
-		m.summaries[fn] = make(map[int]bool)
+	if mm[fn] == nil {
+		mm[fn] = make(map[int]bool)
 	}
-	m.summaries[fn][i] = true
+	mm[fn][i] = true
 	return true
 }
 
@@ -673,7 +750,10 @@ func collectDirectives(pass *analysis.Pass, prog *ssa.Program, m *mutatorIndex) 
 				}
 				for _, i := range idxs {
 					if j := i + offset; j >= 0 {
-						setSummary(m, fn, j)
+						setIndex(m.summaries, fn, j)
+						if i >= 0 && variadicParam(sig, i) {
+							setIndex(m.deep, fn, j)
+						}
 					}
 				}
 			}

@@ -173,6 +173,35 @@ func MergeBox() {
 	box.Merge(nil) // want `box is mutated \(via \(\*(c\.)?Box\)\.Merge\) outside of package initialization`
 }
 
+// --- Variadic parameters: slice-storage writes vs writes through elements. ---
+
+type node struct{ next *node }
+
+var head = &node{}
+var nodes = []*node{{}}
+
+// swap writes only the variadic slice's own storage.
+func swap(xs ...*node) { xs[0], xs[len(xs)-1] = xs[len(xs)-1], xs[0] }
+
+// relink writes through the values held in the variadic slice.
+func relink(xs ...*node) {
+	for _, x := range xs {
+		x.next = nil
+	}
+}
+
+func swapSpread(xs ...*node)   { swap(xs...) }
+func relinkSpread(xs ...*node) { relink(xs...) }
+
+func Variadic() {
+	swap(head, head)       // storage write hits a call-site-fresh array: fine
+	swapSpread(head, head) // fine
+	relink(head)           // want `head is mutated \(via relink\) outside of package initialization`
+	relinkSpread(head)     // want `head is mutated \(via relinkSpread\) outside of package initialization`
+	swap(nodes...)         // want `nodes is mutated \(via swap\) outside of package initialization`
+	relink(nodes...)       // want `nodes is mutated \(via relink\) outside of package initialization`
+}
+
 // --- Reassigning append reports once, via the store. ---
 
 func AppendReassign() {
